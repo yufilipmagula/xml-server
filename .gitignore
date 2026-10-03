@@ -1,0 +1,19 @@
+# Local configuration contains credential hashes and machine-specific paths.
+/config.json
+
+# Runtime logs and test output.
+*.log
+/logs/
+/TestResults/
+/coverage/
+
+# Operating system files.
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor and temporary files.
+*.swp
+*.swo
+*.tmp
+*.bak

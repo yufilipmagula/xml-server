@@ -1,0 +1,24 @@
+{
+  "Server": {
+    "Port": 8443,
+    "MaxThreads": 8,
+    "UrlPrefix": "https://+:8443/api/v1/"
+  },
+  "Storage": {
+    "RootDirectory": "C:\\Data\\XML_Repository",
+    "FileReadRetryCount": 3,
+    "FileReadRetryDelayMs": 50
+  },
+  "Security": {
+    "Username": "service_consumer",
+    "PasswordSaltBase64": "REPLACE_WITH_OUTPUT_OF_New-PasswordHash.ps1",
+    "PasswordHashBase64": "REPLACE_WITH_OUTPUT_OF_New-PasswordHash.ps1",
+    "Pbkdf2Iterations": 100000,
+    "MaxAuthFailures": 5,
+    "LockoutMinutes": 15
+  },
+  "Logging": {
+    "LogDirectory": "C:\\Logs\\XmlDistService",
+    "RetainDays": 14
+  }
+}
