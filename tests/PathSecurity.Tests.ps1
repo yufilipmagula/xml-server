@@ -1,5 +1,5 @@
 #requires -Version 5.1
-# Pester v5. Pure-logic tests - run on PS7/Mac and PS5.1/Windows alike.
+# Pester v5. Pure-logic tests for the path-traversal boundary guard.
 
 BeforeAll {
     Import-Module (Join-Path $PSScriptRoot '..' 'modules' 'PathSecurity.psm1') -Force

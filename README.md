@@ -17,7 +17,7 @@ cz-ps-app/
 │   ├── Lockout.psm1           # Thread-safe per-IP brute-force tracker
 │   ├── Logging.psm1           # Thread-safe rotating audit log + retention purge
 │   └── FileDelivery.psm1      # Shared-read file access with retry
-├── tests/                     # Pester v5 unit suite (runs on PS7/Mac and PS5.1/Windows)
+├── tests/                     # Pester v5 unit suite (Windows PowerShell 5.1)
 │   └── Invoke-Tests.ps1       # Test runner
 └── deploy/
     ├── 01-provision-httpsys.cmd  # One-time netsh urlacl + sslcert (prod)
@@ -25,42 +25,33 @@ cz-ps-app/
     └── Setup-LocalTest.ps1       # Self-signed cert + bindings for local Win11 testing
 ```
 
-## Cross-platform development workflow
+## Development workflow
 
-The code splits into two layers with very different portability:
+Target runtime is **Windows PowerShell 5.1** (in-box on Windows 11 and Windows Server 2019). All development and testing happens on Windows.
 
-| Layer | Modules | Testable on Mac/PS7? |
-| --- | --- | --- |
-| Pure logic | PathSecurity, Authentication, Lockout, Configuration, FileDelivery | **Yes** — plain `.NET` calls present in both PS 5.1 and PS 7 |
-| Hosting | `server.ps1` HttpListener + HTTPS, netsh, NSSM | **No** — HTTPS rides on the Windows-only HTTP.sys kernel driver |
+### 1. Static analysis
 
-### 1. Author + static-check on macOS (PowerShell 7)
-
-```bash
+```powershell
 # One-time
-pwsh -c "Install-Module PSScriptAnalyzer -Scope CurrentUser -Force"
+powershell -Command "Install-Module PSScriptAnalyzer -Scope CurrentUser -Force"
 
-# Catch any PS7-only syntax/commands/types before they reach Windows.
 # Scope to app code: Pester's Should/Invoke-Pester aren't in the in-box
 # command catalog, so they surface as harmless false positives in tests/.
-pwsh -c '@("./modules","./server.ps1","./New-PasswordHash.ps1") | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Recurse -Settings ./PSScriptAnalyzerSettings.psd1 }'
+powershell -Command "@('.\modules','.\server.ps1','.\New-PasswordHash.ps1') | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Recurse -Settings .\PSScriptAnalyzerSettings.psd1 }"
 ```
 
-### 2. Unit-test the logic on macOS (fast loop)
+### 2. Unit tests
 
-```bash
-pwsh -c "Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser -Force"   # one-time
-pwsh ./tests/Invoke-Tests.ps1
+```powershell
+powershell -Command "Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser -Force"   # one-time
+powershell -ExecutionPolicy Bypass -File .\tests\Invoke-Tests.ps1
 ```
 
-### 3. Parity + integration test on local Windows 11
+### 3. Integration test on local Windows 11
 
 Windows 11 ships Windows PowerShell 5.1 and HTTP.sys in-box, so it is a faithful test target for the full stack.
 
 ```powershell
-# Re-run the same unit suite under 5.1 to confirm parity
-powershell -ExecutionPolicy Bypass -File .\tests\Invoke-Tests.ps1
-
 # Prepare local HTTPS (self-signed cert — LOCAL TESTING ONLY), elevated prompt
 powershell -ExecutionPolicy Bypass -File .\deploy\Setup-LocalTest.ps1 -Port 8443
 

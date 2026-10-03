@@ -3,11 +3,10 @@
 .SYNOPSIS
     Runs the Pester v5 unit suite for the pure-logic modules.
 .DESCRIPTION
-    Works on PS7/macOS (fast dev loop) and Windows PowerShell 5.1 (parity check).
+    Runs under Windows PowerShell 5.1.
     Requires Pester v5:  Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser
 .EXAMPLE
-    pwsh ./tests/Invoke-Tests.ps1          # on macOS
-    powershell -File .\tests\Invoke-Tests.ps1   # on Windows 5.1
+    powershell -File .\tests\Invoke-Tests.ps1
 #>
 [CmdletBinding()]
 param ()

@@ -1,7 +1,6 @@
 @{
     # Static analysis pinned to Windows PowerShell 5.1 on Windows Server 2019,
-    # so PS7-only syntax, commands, or .NET types are flagged on the Mac dev loop
-    # before code ever reaches Windows.
+    # so unsupported syntax, commands, or .NET types are flagged before deploy.
     Rules = @{
         PSUseCompatibleSyntax = @{
             Enable         = $true
