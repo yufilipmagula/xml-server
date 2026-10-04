@@ -1,6 +1,11 @@
 @{
     # Static analysis pinned to Windows PowerShell 5.1 on Windows Server 2019,
     # so unsupported syntax, commands, or .NET types are flagged before deploy.
+    IncludeRules = @(
+        'PSUseCompatibleSyntax',
+        'PSUseCompatibleCommands',
+        'PSUseCompatibleTypes'
+    )
     Rules = @{
         PSUseCompatibleSyntax = @{
             Enable         = $true

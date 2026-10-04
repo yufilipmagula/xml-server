@@ -13,13 +13,13 @@
       - /api/v1/files/... missing / non-xml / traversal (unified 404)
       - Brute-force lockout (429 Too Many Requests + Retry-After)
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File .\tests\Invoke-SmokeTest.ps1 -BaseUri 'https://localhost:8443/api/v1' -Username 'consumer' -Password 'secret' -SkipSslCheck
+    powershell -ExecutionPolicy Bypass -File .\tests\Invoke-SmokeTest.ps1 -BaseUri 'https://localhost:8443/api/v1' -Username 'service_consumer' -Password 'local-test-pw' -SkipSslCheck
 #>
 [CmdletBinding()]
 param (
     [string]$BaseUri = 'https://localhost:8443/api/v1',
-    [string]$Username = 'consumer',
-    [string]$Password = 'secret',
+    [string]$Username = 'service_consumer',
+    [string]$Password = 'local-test-pw',
     [switch]$SkipSslCheck
 )
 
@@ -69,6 +69,10 @@ function Invoke-ApiRequest {
     $req = [System.Net.HttpWebRequest]::Create($url)
     $req.Method = $Method
     $req.Timeout = 10000
+
+    if ($Method -eq 'POST') {
+        $req.ContentLength = 0
+    }
 
     if (-not [string]::IsNullOrEmpty($User)) {
         $auth = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes("$User`:$Pass"))
