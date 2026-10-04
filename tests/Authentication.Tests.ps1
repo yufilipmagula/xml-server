@@ -1,4 +1,5 @@
 #requires -Version 5.1
+#requires -PSEdition Desktop
 # Pester 3.4. PBKDF2 + constant-time compare + Basic auth parsing.
 
 $script:AuthenticationModulePath = Join-Path $PSScriptRoot '..\modules\Authentication.psm1'
@@ -27,17 +28,23 @@ Describe 'Get-Pbkdf2Hash' {
     }
 }
 
-Describe 'Test-ConstantTimeEqual' {
-    It 'returns true for identical arrays' {
-        Test-ConstantTimeEqual -Expected $script:ExpectedHash -Actual $script:ExpectedHash | Should Be $true
-    }
-    It 'returns false for a single-byte difference' {
-        $tampered = $script:ExpectedHash.Clone()
-        $tampered[0] = $tampered[0] -bxor 0xFF
-        Test-ConstantTimeEqual -Expected $script:ExpectedHash -Actual $tampered | Should Be $false
-    }
-    It 'returns false for a length mismatch' {
-        Test-ConstantTimeEqual -Expected $script:ExpectedHash -Actual ([byte[]]::new(16)) | Should Be $false
+InModuleScope 'Authentication' {
+    Describe 'Test-ConstantTimeEqual' {
+        BeforeAll {
+            $salt = New-PasswordSalt -Length 32
+            $testHash = Get-Pbkdf2Hash -Password 'test-equal' -Salt $salt -Iterations 1000
+        }
+        It 'returns true for identical arrays' {
+            Test-ConstantTimeEqual -Expected $testHash -Actual $testHash | Should Be $true
+        }
+        It 'returns false for a single-byte difference' {
+            $tampered = $testHash.Clone()
+            $tampered[0] = $tampered[0] -bxor 0xFF
+            Test-ConstantTimeEqual -Expected $testHash -Actual $tampered | Should Be $false
+        }
+        It 'returns false for a length mismatch' {
+            Test-ConstantTimeEqual -Expected $testHash -Actual ([byte[]]::new(16)) | Should Be $false
+        }
     }
 }
 

@@ -1,4 +1,5 @@
 #requires -Version 5.1
+#requires -PSEdition Desktop
 # Pester 3.4. Brute-force lockout tracker.
 
 Describe 'Lockout tracker' {

@@ -1,4 +1,5 @@
 #requires -Version 5.1
+#requires -PSEdition Desktop
 <#
 .SYNOPSIS
     Runs the Pester 3.4 unit suite for the pure-logic modules.

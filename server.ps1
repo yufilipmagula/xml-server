@@ -1,12 +1,13 @@
 #requires -Version 5.1
+#requires -PSEdition Desktop
 <#
 .SYNOPSIS
     PowerShell XML Distribution API - headless read-only REST service.
 .DESCRIPTION
     Main entrypoint. Performs startup self-checks (spec 7.5), builds a
-    RunspacePool with shared state injected via InitialSessionState, runs the
-    HttpListener accept loop, and shuts down gracefully on stop/exception
-    (spec 4.4). Targets Windows PowerShell 5.1 on Windows Server 2019.
+    RunspacePool with shared state, runs the HttpListener accept loop,
+    and shuts down gracefully on stop/exception (spec 4.4).
+    Targets Windows PowerShell 5.1 on Windows Server 2019.
 .NOTES
     HTTPS binding rides on HTTP.sys; it requires a Windows host with a URL ACL
     reservation and an SSL certificate bound to the port (spec 7.1).
@@ -30,7 +31,8 @@ $ModulePaths = @(
     (Join-Path $ModuleRoot 'Authentication.psm1'),
     (Join-Path $ModuleRoot 'Lockout.psm1'),
     (Join-Path $ModuleRoot 'Logging.psm1'),
-    (Join-Path $ModuleRoot 'FileDelivery.psm1')
+    (Join-Path $ModuleRoot 'FileDelivery.psm1'),
+    (Join-Path $ModuleRoot 'RequestHandler.psm1')
 )
 
 foreach ($modulePath in $ModulePaths) {
@@ -38,9 +40,11 @@ foreach ($modulePath in $ModulePaths) {
 }
 
 function Write-Fatal {
-    param ([string]$Message)
-    $stamp = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
-    Write-Error "[$stamp] FATAL: $Message"
+    param (
+        [string]$Message,
+        [string]$LogDir = $null
+    )
+    Write-ServiceLog -Message "FATAL: $Message" -Level 'FATAL' -LogDirectory $LogDir
 }
 
 # -------------------------------------------------------------------------
@@ -50,13 +54,13 @@ try {
     $Config = Import-ServiceConfig -Path $ConfigPath
 }
 catch {
-    Write-Fatal "Configuration load/validation failed: $($_.Exception.Message)"
+    Write-Fatal -Message "Configuration load/validation failed: $($_.Exception.Message)"
     exit 1
 }
 
 $RootDirectory = $Config.Storage.RootDirectory
 if (-not (Test-Path -LiteralPath $RootDirectory -PathType Container)) {
-    Write-Fatal "Storage.RootDirectory does not exist or is not a directory: $RootDirectory"
+    Write-Fatal -Message "Storage.RootDirectory does not exist or is not a directory: $RootDirectory" -LogDir $Config.Logging.LogDirectory
     exit 1
 }
 
@@ -65,20 +69,28 @@ try {
     Initialize-LogDirectory -LogDirectory $LogDirectory
 }
 catch {
-    Write-Fatal "Could not create Logging.LogDirectory '$LogDirectory': $($_.Exception.Message)"
+    Write-Fatal -Message "Could not create Logging.LogDirectory '$LogDirectory': $($_.Exception.Message)"
     exit 1
 }
 
-# SSL binding check - warn (do not abort); the listener will fail on first HTTPS request if absent.
+$LogLock = New-LogLock
 $Port = [int]$Config.Server.Port
-try {
-    $sslInfo = & netsh http show sslcert ipport=0.0.0.0:$Port 2>&1 | Out-String
-    if ($sslInfo -notmatch 'Certificate Hash') {
-        Write-Warning "No SSL certificate binding found for 0.0.0.0:$Port. HTTPS requests will fail until 'netsh http add sslcert' is run (see deploy/01-provision-httpsys.cmd)."
+
+# SSL binding check (B9) - warn (do not abort); the listener will fail on first HTTPS request if absent.
+$isHttps = $Config.Server.UrlPrefix.StartsWith('https://', [System.StringComparison]::OrdinalIgnoreCase)
+if ($isHttps) {
+    try {
+        $sslInfo = & netsh http show sslcert ipport=0.0.0.0:$Port 2>&1 | Out-String
+        if ($sslInfo -notmatch 'Certificate Hash') {
+            $sslAll = & netsh http show sslcert 2>&1 | Out-String
+            if ($sslAll -notmatch ":$Port\b") {
+                Write-ServiceLog -Message "No SSL certificate binding found for port $Port. HTTPS requests will fail until 'netsh http add sslcert' is run (see deploy/01-provision-httpsys.cmd)." -Level 'WARN' -LogDirectory $LogDirectory -LogLock $LogLock
+            }
+        }
     }
-}
-catch {
-    Write-Warning "Could not query SSL binding via netsh: $($_.Exception.Message)"
+    catch {
+        Write-ServiceLog -Message "Could not query SSL binding via netsh: $($_.Exception.Message)" -Level 'WARN' -LogDirectory $LogDirectory -LogLock $LogLock
+    }
 }
 
 Remove-OldLogs -LogDirectory $LogDirectory -RetainDays ([int]$Config.Logging.RetainDays)
@@ -88,164 +100,73 @@ $lastPurgeDate = [DateTime]::UtcNow.Date
 # Shared state + RunspacePool (spec 4.1, 4.2)
 # -------------------------------------------------------------------------
 $FailureTracker = New-FailureTracker
-$LogLock = New-LogLock
 $PasswordSalt = [Convert]::FromBase64String($Config.Security.PasswordSaltBase64)
 $PasswordHash = [Convert]::FromBase64String($Config.Security.PasswordHashBase64)
 
 $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
 $iss.ImportPSModule($ModulePaths)
-$iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('ServiceConfig', $Config, ''))
-$iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('FailureTracker', $FailureTracker, ''))
-$iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('LogLock', $LogLock, ''))
-$iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('PasswordSalt', $PasswordSalt, ''))
-$iss.Variables.Add([System.Management.Automation.Runspaces.SessionStateVariableEntry]::new('PasswordHash', $PasswordHash, ''))
 
 $MaxThreads = [int]$Config.Server.MaxThreads
+$MaxBacklog = $MaxThreads * 4
 $Pool = [runspacefactory]::CreateRunspacePool(1, $MaxThreads, $iss, $Host)
 $Pool.Open()
 
 # -------------------------------------------------------------------------
-# Worker: processes one HttpListenerContext end to end (spec 4.1)
-# Runs inside a pool runspace; module functions and shared variables are
-# supplied by the InitialSessionState above.
+# Helper functions for accept loop (C1, C11)
 # -------------------------------------------------------------------------
-$WorkerScript = {
-    param ($Context)
-
-    Set-StrictMode -Version Latest
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $request = $Context.Request
-    $response = $Context.Response
-    $clientIp = if ($request.RemoteEndPoint) { $request.RemoteEndPoint.Address.ToString() } else { 'unknown' }
-    $absolutePath = $request.Url.AbsolutePath
-    $status = 500
-    $realReason = ''
-
-    try {
-        $prefix = '/api/v1'
-
-        # Health endpoint: unauthenticated, no FS access, GET only (spec 2.3).
-        if ($absolutePath -eq "$prefix/health") {
-            if ($request.HttpMethod -ne 'GET') {
-                $status = 405
-                Send-Status -Response $response -Code 405
-            }
-            else {
-                $status = 200
-                $body = [System.Text.Encoding]::UTF8.GetBytes('{"status":"ok"}')
-                Send-Status -Response $response -Code 200 -Body $body -ContentType 'application/json; charset=utf-8'
-            }
-            return
+function Invoke-JobReaping {
+    param ([System.Collections.ArrayList]$JobList)
+    for ($i = $JobList.Count - 1; $i -ge 0; $i--) {
+        if ($JobList[$i].Handle.IsCompleted) {
+            try { [void]$JobList[$i].PowerShell.EndInvoke($JobList[$i].Handle) } catch { [void]$_ }
+            $JobList[$i].PowerShell.Dispose()
+            $JobList.RemoveAt($i)
         }
-
-        # File endpoint.
-        if (-not $absolutePath.StartsWith("$prefix/files/", [System.StringComparison]::OrdinalIgnoreCase)) {
-            $status = 404
-            $realReason = 'route not matched'
-            Send-Status -Response $response -Code 404
-            return
-        }
-
-        if ($request.HttpMethod -ne 'GET') {
-            $status = 405
-            Send-Status -Response $response -Code 405
-            return
-        }
-
-        # Lockout check BEFORE auth/file processing (spec 3.3).
-        $retryAfter = Get-LockoutRetryAfterSeconds -Tracker $FailureTracker -ClientIp $clientIp
-        if ($retryAfter -gt 0) {
-            $status = 429
-            Send-Status -Response $response -Code 429 -Headers @{ 'Retry-After' = $retryAfter }
-            return
-        }
-
-        # Authentication (spec 3.2).
-        $credential = Read-BasicAuthorization -AuthorizationHeader $request.Headers['Authorization']
-        $authOk = Test-ServiceCredential -Credential $credential `
-            -ExpectedUsername $ServiceConfig.Security.Username `
-            -Salt $PasswordSalt -ExpectedHash $PasswordHash `
-            -Iterations ([int]$ServiceConfig.Security.Pbkdf2Iterations)
-
-        if (-not $authOk) {
-            Add-AuthFailure -Tracker $FailureTracker -ClientIp $clientIp `
-                -MaxAuthFailures ([int]$ServiceConfig.Security.MaxAuthFailures) `
-                -LockoutMinutes ([int]$ServiceConfig.Security.LockoutMinutes)
-            $status = 401
-            Send-Status -Response $response -Code 401 -Headers @{ 'WWW-Authenticate' = 'Basic realm="XmlDistributionService"' }
-            return
-        }
-        Clear-AuthFailures -Tracker $FailureTracker -ClientIp $clientIp
-
-        # Path boundary guard (spec 3.1). Sub-path is already decoded exactly once.
-        $subPath = $absolutePath.Substring("$prefix/files/".Length)
-        $safeTarget = Test-SafePath -RootDirectory $ServiceConfig.Storage.RootDirectory -RequestedSubPath $subPath
-        if ($null -eq $safeTarget) {
-            $status = 404
-            $realReason = "boundary/extension/existence rejection for sub-path '$subPath'"
-            Send-Status -Response $response -Code 404
-            return
-        }
-
-        # File delivery with retry (spec 4.3).
-        try {
-            $bytes = Read-XmlFileBytes -Path $safeTarget `
-                -MaxRetries ([int]$ServiceConfig.Storage.FileReadRetryCount) `
-                -DelayMs ([int]$ServiceConfig.Storage.FileReadRetryDelayMs)
-        }
-        catch [System.IO.IOException] {
-            $status = 503
-            $realReason = "sharing violation after retries: $($_.Exception.Message)"
-            Send-Status -Response $response -Code 503
-            return
-        }
-
-        $lastModified = ([System.IO.File]::GetLastWriteTimeUtc($safeTarget)).ToString('R')
-        $status = 200
-        Send-Status -Response $response -Code 200 -Body $bytes `
-            -ContentType 'application/xml; charset=utf-8' `
-            -Headers @{ 'Last-Modified' = $lastModified; 'Cache-Control' = 'no-cache' }
     }
-    catch {
-        $status = 500
-        $realReason = "unhandled worker fault: $($_.Exception.Message)"
-        try { Send-Status -Response $response -Code 500 } catch { [void]$_ }
-    }
-    finally {
-        $sw.Stop()
+}
+
+function Invoke-DailyMaintenance {
+    param (
+        [string]$LogDir,
+        [int]$RetainDays,
+        [hashtable]$Tracker,
+        [ref]$LastPurgeDateRef,
+        [object]$LockObj
+    )
+    $todayUtc = [DateTime]::UtcNow.Date
+    if ($todayUtc -gt $LastPurgeDateRef.Value) {
         try {
-            Write-AuditLog -LogDirectory $ServiceConfig.Logging.LogDirectory -LogLock $LogLock `
-                -ClientIp $clientIp -RequestedPath $absolutePath -StatusCode $status `
-                -ResponseTimeMs ([int]$sw.ElapsedMilliseconds) -ExceptionMessage $realReason
+            Remove-OldLogs -LogDirectory $LogDir -RetainDays $RetainDays
+            Remove-ExpiredAuthFailures -Tracker $Tracker
+            $LastPurgeDateRef.Value = $todayUtc
         }
         catch {
-            [Console]::Error.WriteLine("[$([DateTime]::UtcNow.ToString('o'))] Audit log write failed: $($_.Exception.Message)")
+            Write-ServiceLog -Message "Daily log retention/tracker purge failed: $($_.Exception.Message)" -Level 'WARN' -LogDirectory $LogDir -LogLock $LockObj
         }
-        try { $response.OutputStream.Close() } catch { [void]$_ }
-        try { $response.Close() } catch { [void]$_ }
     }
 }
 
 # -------------------------------------------------------------------------
-# HttpListener accept loop + graceful shutdown (spec 4.1, 4.4)
+# HttpListener accept loop + graceful shutdown (spec 4.1, 4.4, S7, B7)
 # -------------------------------------------------------------------------
 $Listener = [System.Net.HttpListener]::new()
 $Listener.Prefixes.Add($Config.Server.UrlPrefix)
+
+# HTTP.sys connection timeout protection (S7)
+try {
+    $Listener.TimeoutManager.IdleConnection = [TimeSpan]::FromSeconds(120)
+    $Listener.TimeoutManager.HeaderWait = [TimeSpan]::FromSeconds(30)
+}
+catch {
+    # Non-fatal if platform does not permit setting TimeoutManager
+    [void]$_
+}
+
 $Jobs = [System.Collections.ArrayList]::new()
 
 try {
     $Listener.Start()
-    Write-Host "XmlDistributionService listening on $($Config.Server.UrlPrefix) (MaxThreads=$MaxThreads)"
-
-    function script:Invoke-JobReaping {
-        for ($i = $Jobs.Count - 1; $i -ge 0; $i--) {
-            if ($Jobs[$i].Handle.IsCompleted) {
-                try { [void]$Jobs[$i].PowerShell.EndInvoke($Jobs[$i].Handle) } catch { [void]$_ }
-                $Jobs[$i].PowerShell.Dispose()
-                $Jobs.RemoveAt($i)
-            }
-        }
-    }
+    Write-ServiceLog -Message "XmlDistributionService listening on $($Config.Server.UrlPrefix) (MaxThreads=$MaxThreads, MaxBacklog=$MaxBacklog)" -Level 'INFO' -LogDirectory $LogDirectory -LogLock $LogLock
 
     $asyncContext = $null
     while ($Listener.IsListening) {
@@ -263,19 +184,8 @@ try {
 
         # Non-blocking wait with 500ms timeout: allows idle worker reaping, daily log purge, and responsive shutdown.
         if (-not $asyncContext.AsyncWaitHandle.WaitOne(500)) {
-            Invoke-JobReaping
-
-            $todayUtc = [DateTime]::UtcNow.Date
-            if ($todayUtc -gt $lastPurgeDate) {
-                try {
-                    Remove-OldLogs -LogDirectory $LogDirectory -RetainDays ([int]$Config.Logging.RetainDays)
-                    Remove-ExpiredAuthFailures -Tracker $FailureTracker
-                    $lastPurgeDate = $todayUtc
-                }
-                catch {
-                    Write-Warning "Daily log retention/tracker purge failed: $($_.Exception.Message)"
-                }
-            }
+            Invoke-JobReaping -JobList $Jobs
+            Invoke-DailyMaintenance -LogDir $LogDirectory -RetainDays ([int]$Config.Logging.RetainDays) -Tracker $FailureTracker -LastPurgeDateRef ([ref]$lastPurgeDate) -LockObj $LogLock
             continue
         }
 
@@ -292,38 +202,58 @@ try {
             $asyncContext = $null
         }
 
+        Invoke-JobReaping -JobList $Jobs
+
+        # DoS overload protection (S7): shed load with 503 if worker backlog exceeds threshold
+        if ($Jobs.Count -ge $MaxBacklog) {
+            try {
+                $context.Response.StatusCode = 503
+                $context.Response.Headers.Add('Retry-After', '5')
+                $context.Response.Close()
+            }
+            catch { [void]$_ }
+            continue
+        }
+
+        # Dispatch request to runspace pool using RequestHandler (C2, C12)
         $ps = [powershell]::Create()
         $ps.RunspacePool = $Pool
-        [void]$ps.AddScript($WorkerScript.ToString()).AddArgument($context)
+        [void]$ps.AddCommand('Invoke-RequestHandler')
+        [void]$ps.AddParameter('Context', $context)
+        [void]$ps.AddParameter('Config', $Config)
+        [void]$ps.AddParameter('FailureTracker', $FailureTracker)
+        [void]$ps.AddParameter('LogLock', $LogLock)
+        [void]$ps.AddParameter('PasswordSalt', $PasswordSalt)
+        [void]$ps.AddParameter('PasswordHash', $PasswordHash)
+
         $handle = $ps.BeginInvoke()
         [void]$Jobs.Add([pscustomobject]@{ PowerShell = $ps; Handle = $handle })
 
-        Invoke-JobReaping
-
-        # Once-per-day log retention and tracker purge (spec 7.5).
-        $todayUtc = [DateTime]::UtcNow.Date
-        if ($todayUtc -gt $lastPurgeDate) {
-            try {
-                Remove-OldLogs -LogDirectory $LogDirectory -RetainDays ([int]$Config.Logging.RetainDays)
-                Remove-ExpiredAuthFailures -Tracker $FailureTracker
-                $lastPurgeDate = $todayUtc
-            }
-            catch {
-                Write-Warning "Daily log retention/tracker purge failed: $($_.Exception.Message)"
-            }
-        }
+        Invoke-DailyMaintenance -LogDir $LogDirectory -RetainDays ([int]$Config.Logging.RetainDays) -Tracker $FailureTracker -LastPurgeDateRef ([ref]$lastPurgeDate) -LockObj $LogLock
     }
 }
 finally {
-    Write-Host 'Shutting down XmlDistributionService...'
+    Write-ServiceLog -Message 'Shutting down XmlDistributionService...' -Level 'INFO' -LogDirectory $LogDirectory -LogLock $LogLock
     try { if ($Listener.IsListening) { $Listener.Stop() } } catch { [void]$_ }
     try { $Listener.Close() } catch { [void]$_ }
 
+    # Bounded wait for in-flight requests (B7)
     foreach ($job in $Jobs) {
-        try { [void]$job.PowerShell.EndInvoke($job.Handle) } catch { [void]$_ }
-        try { $job.PowerShell.Dispose() } catch { [void]$_ }
+        try {
+            if (-not $job.Handle.IsCompleted) {
+                [void]$job.Handle.AsyncWaitHandle.WaitOne(3000)
+            }
+            if ($job.Handle.IsCompleted) {
+                try { [void]$job.PowerShell.EndInvoke($job.Handle) } catch { [void]$_ }
+            }
+            else {
+                $job.PowerShell.Stop()
+            }
+            $job.PowerShell.Dispose()
+        }
+        catch { [void]$_ }
     }
     try { $Pool.Close() } catch { [void]$_ }
     try { $Pool.Dispose() } catch { [void]$_ }
-    Write-Host 'Shutdown complete.'
+    Write-ServiceLog -Message 'Shutdown complete.' -Level 'INFO' -LogDirectory $LogDirectory -LogLock $LogLock
 }

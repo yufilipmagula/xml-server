@@ -1,4 +1,5 @@
 #requires -Version 5.1
+#requires -PSEdition Desktop
 # Pester 3.4. Shared-read file access with retry.
 
 Describe 'Read-XmlFileBytes' {

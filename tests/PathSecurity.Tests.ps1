@@ -1,4 +1,5 @@
 #requires -Version 5.1
+#requires -PSEdition Desktop
 # Pester 3.4. Pure-logic tests for the path-traversal boundary guard.
 
 Describe 'Test-SafePath' {
@@ -61,5 +62,18 @@ AfterAll {
         @('bad<file>.xml', 'report>1.xml', 'wild*card.xml', 'query?test.xml', 'pipe|name.xml', 'quote"name.xml') | ForEach-Object {
             Test-SafePath -RootDirectory $script:Root -RequestedSubPath $_ | Should BeNullOrEmpty
         }
+    }
+
+    It 'rejects trailing dot and trailing space tricks' {
+        @('report.xml.', 'report.xml ', 'finance/2026./report.xml', 'finance/2026 /report.xml') | ForEach-Object {
+            Test-SafePath -RootDirectory $script:Root -RequestedSubPath $_ | Should BeNullOrEmpty
+        }
+    }
+
+    It 'resolves files with spaces in their names when the file exists (B1)' {
+        Set-Content -LiteralPath (Join-Path $script:Root 'finance\2026\my report.xml') -Value '<r/>' -Encoding UTF8
+        $result = Test-SafePath -RootDirectory $script:Root -RequestedSubPath 'finance/2026/my report.xml'
+        $result | Should Not BeNullOrEmpty
+        $result | Should BeLike '*my report.xml'
     }
 }

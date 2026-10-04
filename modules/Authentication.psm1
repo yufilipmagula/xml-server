@@ -10,6 +10,39 @@ Set-StrictMode -Version Latest
     defaults to SHA1 and must never be used.
 #>
 
+$script:SaltBytes = 32   # spec 3.2
+
+function New-PasswordSalt {
+    [CmdletBinding()]
+    [OutputType([byte[]])]
+    param (
+        [int]$Length = $script:SaltBytes
+    )
+
+    $salt = [byte[]]::new($Length)
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $rng.GetBytes($salt)
+    }
+    finally {
+        $rng.Dispose()
+    }
+    return , $salt
+}
+
+function Get-Sha256Digest {
+    [OutputType([byte[]])]
+    param ([AllowEmptyString()][string]$Value)
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return , $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Value))
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
 function Get-Pbkdf2Hash {
     [CmdletBinding()]
     [OutputType([byte[]])]
@@ -115,7 +148,9 @@ function Test-ServiceCredential {
 
     if ($null -eq $Credential) { return $false }
 
-    $usernameMatches = [string]::Equals($Credential.Username, $ExpectedUsername, [System.StringComparison]::Ordinal)
+    # Compare fixed-length SHA-256 digests in constant time so neither the username's
+    # content nor its length is observable through timing.
+    $usernameMatches = Test-ConstantTimeEqual -Expected (Get-Sha256Digest $ExpectedUsername) -Actual (Get-Sha256Digest $Credential.Username)
     $derived = Get-Pbkdf2Hash -Password $Credential.Password -Salt $Salt -Iterations $Iterations -Length $ExpectedHash.Length
     $hashMatches = Test-ConstantTimeEqual -Expected $ExpectedHash -Actual $derived
 
@@ -123,4 +158,4 @@ function Test-ServiceCredential {
     return ($usernameMatches -and $hashMatches)
 }
 
-Export-ModuleMember -Function Get-Pbkdf2Hash, Test-ConstantTimeEqual, Read-BasicAuthorization, Test-ServiceCredential
+Export-ModuleMember -Function New-PasswordSalt, Get-Pbkdf2Hash, Read-BasicAuthorization, Test-ServiceCredential

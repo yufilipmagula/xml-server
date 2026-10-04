@@ -1,4 +1,5 @@
 #requires -Version 5.1
+#requires -PSEdition Desktop
 Set-StrictMode -Version Latest
 
 <#
@@ -11,6 +12,11 @@ Set-StrictMode -Version Latest
     and resets on service restart, by design.
 #>
 
+$script:MaxTrackerEntries = 10000
+$script:InlinePurgeThreshold = 200
+$script:MinPurgeIntervalSeconds = 60
+$script:LastInlinePurgeUtc = [DateTime]::MinValue
+
 function New-FailureTracker {
     [CmdletBinding()]
     [OutputType([hashtable])]
@@ -21,7 +27,7 @@ function New-FailureTracker {
 function Get-LockoutRetryAfterSeconds {
     <#
         Returns the number of whole seconds remaining on an active lockout for
-        the given IP, or 0 if the IP is not currently locked.
+        the given IP, or 0 if the IP is not currently locked. Pure query (CQS).
     #>
     [CmdletBinding()]
     [OutputType([int])]
@@ -41,10 +47,6 @@ function Get-LockoutRetryAfterSeconds {
 
         $remaining = $record.LockedUntilUtc - [DateTime]::UtcNow
         if ($remaining.TotalSeconds -le 0) {
-            # Lockout expired; reset lock and failure count
-            $record.LockedUntilUtc = $null
-            $record.FailureCount = 0
-            $Tracker[$ClientIp] = $record
             return 0
         }
         return [int][Math]::Ceiling($remaining.TotalSeconds)
@@ -104,9 +106,25 @@ function Add-AuthFailure {
         }
         $Tracker[$ClientIp] = $record
 
-        # Bound tracker memory if distinct tracking entries accumulate
-        if ($Tracker.Count -ge 100) {
-            Remove-ExpiredAuthFailures -Tracker $Tracker -MaxAgeMinutes ([Math]::Max(60, $LockoutMinutes * 2))
+        # Rate-limited cleanup to prevent unbounded memory growth without per-failure O(N) penalty (S9)
+        if ($Tracker.Count -ge $script:InlinePurgeThreshold) {
+            if (($now - $script:LastInlinePurgeUtc).TotalSeconds -ge $script:MinPurgeIntervalSeconds) {
+                $script:LastInlinePurgeUtc = $now
+                Remove-ExpiredAuthFailures -Tracker $Tracker -MaxAgeMinutes ([Math]::Max(60, $LockoutMinutes * 2))
+
+                # Hard cap protection: if still overloaded, evict oldest entries
+                if ($Tracker.Count -gt $script:MaxTrackerEntries) {
+                    $excess = $Tracker.Count - $script:MaxTrackerEntries
+                    $oldestIps = [System.Collections.ArrayList]::new()
+                    foreach ($ip in $Tracker.Keys) {
+                        [void]$oldestIps.Add(@{ Ip = $ip; Time = $Tracker[$ip].FirstFailureUtc })
+                    }
+                    $oldestIps.Sort({ param($a, $b) [DateTime]::Compare($a.Time, $b.Time) })
+                    for ($i = 0; $i -lt [Math]::Min($excess, $oldestIps.Count); $i++) {
+                        [void]$Tracker.Remove($oldestIps[$i].Ip)
+                    }
+                }
+            }
         }
     }
     finally {

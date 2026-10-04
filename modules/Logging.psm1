@@ -1,4 +1,5 @@
 #requires -Version 5.1
+#requires -PSEdition Desktop
 Set-StrictMode -Version Latest
 
 <#
@@ -61,8 +62,10 @@ function Write-AuditLog {
         [string]$ExceptionMessage = ''
     )
 
-    $timestamp = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
-    $datePart = [DateTime]::UtcNow.ToString('yyyy-MM-dd')
+    # Capture UtcNow once to prevent boundary skew across midnight (B10)
+    $now = [DateTime]::UtcNow
+    $timestamp = $now.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    $datePart = $now.ToString('yyyy-MM-dd')
     $logFile = Join-Path -Path $LogDirectory -ChildPath ("audit_{0}.log" -f $datePart)
 
     # Pipe-delimited; sanitize field separators and newlines out of free text.
@@ -79,8 +82,60 @@ function Write-AuditLog {
     }
 }
 
+function Write-ServiceLog {
+    <#
+        Writes service-level lifecycle events (startup, shutdown, maintenance, errors)
+        with timestamps to console and service_YYYY-MM-DD.log (C13).
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [string]$Message,
+
+        [string]$Level = 'INFO',
+
+        [string]$LogDirectory = $null,
+
+        [object]$LogLock = $null
+    )
+
+    $now = [DateTime]::UtcNow
+    $timestamp = $now.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    $formatted = "[$timestamp] [$Level] $Message"
+
+    if ($Level -eq 'FATAL' -or $Level -eq 'ERROR') {
+        [Console]::Error.WriteLine($formatted)
+    }
+    else {
+        [Console]::Out.WriteLine($formatted)
+    }
+
+    if (-not [string]::IsNullOrEmpty($LogDirectory) -and (Test-Path -LiteralPath $LogDirectory)) {
+        try {
+            $datePart = $now.ToString('yyyy-MM-dd')
+            $logFile = Join-Path -Path $LogDirectory -ChildPath ("service_{0}.log" -f $datePart)
+            if ($null -ne $LogLock) {
+                [System.Threading.Monitor]::Enter($LogLock)
+                try {
+                    [System.IO.File]::AppendAllText($logFile, $formatted + [Environment]::NewLine, $script:Utf8NoBom)
+                }
+                finally {
+                    [System.Threading.Monitor]::Exit($LogLock)
+                }
+            }
+            else {
+                [System.IO.File]::AppendAllText($logFile, $formatted + [Environment]::NewLine, $script:Utf8NoBom)
+            }
+        }
+        catch {
+            # Non-terminating fallback to stderr
+            [Console]::Error.WriteLine("[$timestamp] [WARN] Could not write to service log file: $($_.Exception.Message)")
+        }
+    }
+}
+
 function Remove-OldLogs {
-    <# Purge audit_*.log files whose last-write time predates the retention window. #>
+    <# Purge audit_*.log and service_*.log files whose last-write time predates the retention window. #>
     [CmdletBinding()]
     param (
         [Parameter(Mandatory)]
@@ -92,9 +147,9 @@ function Remove-OldLogs {
 
     if (-not (Test-Path -LiteralPath $LogDirectory)) { return }
     $cutoff = [DateTime]::UtcNow.AddDays(-$RetainDays)
-    Get-ChildItem -LiteralPath $LogDirectory -Filter 'audit_*.log' -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTimeUtc -lt $cutoff } |
+    Get-ChildItem -LiteralPath $LogDirectory -Filter '*.log' -File -ErrorAction SilentlyContinue |
+        Where-Object { ($_.Name -like 'audit_*.log' -or $_.Name -like 'service_*.log') -and $_.LastWriteTimeUtc -lt $cutoff } |
         ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
 }
 
-Export-ModuleMember -Function New-LogLock, Initialize-LogDirectory, Write-AuditLog, Remove-OldLogs
+Export-ModuleMember -Function New-LogLock, Initialize-LogDirectory, Write-AuditLog, Write-ServiceLog, Remove-OldLogs
