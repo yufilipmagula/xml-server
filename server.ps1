@@ -13,11 +13,15 @@
 #>
 [CmdletBinding()]
 param (
-    [string]$ConfigPath = (Join-Path -Path $PSScriptRoot -ChildPath 'config.json')
+    [string]$ConfigPath
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+    $ConfigPath = Join-Path -Path $PSScriptRoot -ChildPath 'config.json'
+}
 
 $ModuleRoot = Join-Path -Path $PSScriptRoot -ChildPath 'modules'
 $ModulePaths = @(
@@ -78,6 +82,7 @@ catch {
 }
 
 Remove-OldLogs -LogDirectory $LogDirectory -RetainDays ([int]$Config.Logging.RetainDays)
+$lastPurgeDate = [DateTime]::UtcNow.Date
 
 # -------------------------------------------------------------------------
 # Shared state + RunspacePool (spec 4.1, 4.2)
@@ -115,20 +120,6 @@ $WorkerScript = {
     $absolutePath = $request.Url.AbsolutePath
     $status = 500
     $realReason = ''
-
-    function Send-Status {
-        param ($Response, [int]$Code, [hashtable]$Headers = @{}, [byte[]]$Body = $null, [string]$ContentType = $null)
-        $Response.StatusCode = $Code
-        foreach ($h in $Headers.Keys) { $Response.Headers[$h] = [string]$Headers[$h] }
-        if ($ContentType) { $Response.ContentType = $ContentType }
-        if ($null -ne $Body) {
-            $Response.ContentLength64 = $Body.Length
-            $Response.OutputStream.Write($Body, 0, $Body.Length)
-        }
-        else {
-            $Response.ContentLength64 = 0
-        }
-    }
 
     try {
         $prefix = '/api/v1'
@@ -218,7 +209,7 @@ $WorkerScript = {
     catch {
         $status = 500
         $realReason = "unhandled worker fault: $($_.Exception.Message)"
-        try { Send-Status -Response $response -Code 500 } catch { }
+        try { Send-Status -Response $response -Code 500 } catch { [void]$_ }
     }
     finally {
         $sw.Stop()
@@ -227,9 +218,11 @@ $WorkerScript = {
                 -ClientIp $clientIp -RequestedPath $absolutePath -StatusCode $status `
                 -ResponseTimeMs ([int]$sw.ElapsedMilliseconds) -ExceptionMessage $realReason
         }
-        catch { }
-        try { $response.OutputStream.Close() } catch { }
-        try { $response.Close() } catch { }
+        catch {
+            [Console]::Error.WriteLine("[$([DateTime]::UtcNow.ToString('o'))] Audit log write failed: $($_.Exception.Message)")
+        }
+        try { $response.OutputStream.Close() } catch { [void]$_ }
+        try { $response.Close() } catch { [void]$_ }
     }
 }
 
@@ -244,8 +237,60 @@ try {
     $Listener.Start()
     Write-Host "XmlDistributionService listening on $($Config.Server.UrlPrefix) (MaxThreads=$MaxThreads)"
 
+    function script:Invoke-JobReaping {
+        for ($i = $Jobs.Count - 1; $i -ge 0; $i--) {
+            if ($Jobs[$i].Handle.IsCompleted) {
+                try { [void]$Jobs[$i].PowerShell.EndInvoke($Jobs[$i].Handle) } catch { [void]$_ }
+                $Jobs[$i].PowerShell.Dispose()
+                $Jobs.RemoveAt($i)
+            }
+        }
+    }
+
+    $asyncContext = $null
     while ($Listener.IsListening) {
-        $context = $Listener.GetContext()   # blocking accept
+        if ($null -eq $asyncContext) {
+            try {
+                $asyncContext = $Listener.BeginGetContext($null, $null)
+            }
+            catch [System.Net.HttpListenerException] {
+                break
+            }
+            catch [System.ObjectDisposedException] {
+                break
+            }
+        }
+
+        # Non-blocking wait with 500ms timeout: allows idle worker reaping, daily log purge, and responsive shutdown.
+        if (-not $asyncContext.AsyncWaitHandle.WaitOne(500)) {
+            Invoke-JobReaping
+
+            $todayUtc = [DateTime]::UtcNow.Date
+            if ($todayUtc -gt $lastPurgeDate) {
+                try {
+                    Remove-OldLogs -LogDirectory $LogDirectory -RetainDays ([int]$Config.Logging.RetainDays)
+                    Remove-ExpiredAuthFailures -Tracker $FailureTracker
+                    $lastPurgeDate = $todayUtc
+                }
+                catch {
+                    Write-Warning "Daily log retention/tracker purge failed: $($_.Exception.Message)"
+                }
+            }
+            continue
+        }
+
+        try {
+            $context = $Listener.EndGetContext($asyncContext)
+        }
+        catch [System.Net.HttpListenerException] {
+            break
+        }
+        catch [System.ObjectDisposedException] {
+            break
+        }
+        finally {
+            $asyncContext = $null
+        }
 
         $ps = [powershell]::Create()
         $ps.RunspacePool = $Pool
@@ -253,26 +298,32 @@ try {
         $handle = $ps.BeginInvoke()
         [void]$Jobs.Add([pscustomobject]@{ PowerShell = $ps; Handle = $handle })
 
-        # Reap completed workers to release runspaces and surface faults.
-        for ($i = $Jobs.Count - 1; $i -ge 0; $i--) {
-            if ($Jobs[$i].Handle.IsCompleted) {
-                try { [void]$Jobs[$i].PowerShell.EndInvoke($Jobs[$i].Handle) } catch { }
-                $Jobs[$i].PowerShell.Dispose()
-                $Jobs.RemoveAt($i)
+        Invoke-JobReaping
+
+        # Once-per-day log retention and tracker purge (spec 7.5).
+        $todayUtc = [DateTime]::UtcNow.Date
+        if ($todayUtc -gt $lastPurgeDate) {
+            try {
+                Remove-OldLogs -LogDirectory $LogDirectory -RetainDays ([int]$Config.Logging.RetainDays)
+                Remove-ExpiredAuthFailures -Tracker $FailureTracker
+                $lastPurgeDate = $todayUtc
+            }
+            catch {
+                Write-Warning "Daily log retention/tracker purge failed: $($_.Exception.Message)"
             }
         }
     }
 }
 finally {
     Write-Host 'Shutting down XmlDistributionService...'
-    try { if ($Listener.IsListening) { $Listener.Stop() } } catch { }
-    try { $Listener.Close() } catch { }
+    try { if ($Listener.IsListening) { $Listener.Stop() } } catch { [void]$_ }
+    try { $Listener.Close() } catch { [void]$_ }
 
     foreach ($job in $Jobs) {
-        try { [void]$job.PowerShell.EndInvoke($job.Handle) } catch { }
-        try { $job.PowerShell.Dispose() } catch { }
+        try { [void]$job.PowerShell.EndInvoke($job.Handle) } catch { [void]$_ }
+        try { $job.PowerShell.Dispose() } catch { [void]$_ }
     }
-    try { $Pool.Close() } catch { }
-    try { $Pool.Dispose() } catch { }
+    try { $Pool.Close() } catch { [void]$_ }
+    try { $Pool.Dispose() } catch { [void]$_ }
     Write-Host 'Shutdown complete.'
 }

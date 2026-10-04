@@ -5,7 +5,7 @@ Headless, read-only REST service that serves `.xml` files from a local directory
 ## Project layout
 
 ```
-cz-ps-app/
+xml-server/
 ├── server.ps1                 # Entrypoint: self-checks, RunspacePool listener, graceful shutdown
 ├── New-PasswordHash.ps1       # CLI: generate PBKDF2 salt+hash for config.json
 ├── config.example.json        # Config template — copy to config.json and fill in
@@ -17,7 +17,7 @@ cz-ps-app/
 │   ├── Lockout.psm1           # Thread-safe per-IP brute-force tracker
 │   ├── Logging.psm1           # Thread-safe rotating audit log + retention purge
 │   └── FileDelivery.psm1      # Shared-read file access with retry
-├── tests/                     # Pester v5 unit suite (Windows PowerShell 5.1)
+├── tests/                     # Pester 3.4.0 unit suite (in-box on Windows PowerShell 5.1)
 │   └── Invoke-Tests.ps1       # Test runner
 └── deploy/
     ├── 01-provision-httpsys.cmd  # One-time netsh urlacl + sslcert (prod)
@@ -37,13 +37,13 @@ powershell -Command "Install-Module PSScriptAnalyzer -Scope CurrentUser -Force"
 
 # Scope to app code: Pester's Should/Invoke-Pester aren't in the in-box
 # command catalog, so they surface as harmless false positives in tests/.
-powershell -Command "@('.\modules','.\server.ps1','.\New-PasswordHash.ps1') | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Recurse -Settings .\PSScriptAnalyzerSettings.psd1 }"
+powershell -ExecutionPolicy Bypass -Command { Import-Module PSScriptAnalyzer; @('.\modules','.\server.ps1','.\New-PasswordHash.ps1') | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Recurse -Settings .\PSScriptAnalyzerSettings.psd1 } }
 ```
 
 ### 2. Unit tests
 
 ```powershell
-powershell -Command "Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser -Force"   # one-time
+# Uses the Pester 3.4.0 module included with Windows PowerShell 5.1
 powershell -ExecutionPolicy Bypass -File .\tests\Invoke-Tests.ps1
 ```
 
@@ -80,4 +80,3 @@ curl.exe -k -u service_consumer:local-test-pw https://localhost:8443/api/v1/file
 - **Never use PowerShell 7+ features** — 5.1 is the sole supported runtime (spec 1.2). The analyzer settings enforce this; keep the build clean.
 - `config.json` holds only the PBKDF2 salt+hash (not reversible to plaintext) but should still be ACL-restricted to the service account and administrators (spec 8).
 - Brute-force state is in-memory and resets on restart, by design (spec 3.3).
-```

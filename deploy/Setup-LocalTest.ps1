@@ -1,4 +1,5 @@
 #requires -Version 5.1
+#requires -RunAsAdministrator
 <#
 .SYNOPSIS
     Prepares a local Windows 11 box for integration testing (self-signed cert +

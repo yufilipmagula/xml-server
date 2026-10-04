@@ -40,7 +40,13 @@ function Get-LockoutRetryAfterSeconds {
         if ($null -eq $record.LockedUntilUtc) { return 0 }
 
         $remaining = $record.LockedUntilUtc - [DateTime]::UtcNow
-        if ($remaining.TotalSeconds -le 0) { return 0 }
+        if ($remaining.TotalSeconds -le 0) {
+            # Lockout expired; reset lock and failure count
+            $record.LockedUntilUtc = $null
+            $record.FailureCount = 0
+            $Tracker[$ClientIp] = $record
+            return 0
+        }
         return [int][Math]::Ceiling($remaining.TotalSeconds)
     }
     finally {
@@ -80,11 +86,28 @@ function Add-AuthFailure {
         }
 
         $record = $Tracker[$ClientIp]
+
+        # Reset count if previous lockout has expired, or if rolling failure window elapsed
+        if ($null -ne $record.LockedUntilUtc -and $now -ge $record.LockedUntilUtc) {
+            $record.FailureCount = 0
+            $record.LockedUntilUtc = $null
+            $record.FirstFailureUtc = $now
+        }
+        elseif ($null -eq $record.LockedUntilUtc -and ($now - $record.FirstFailureUtc).TotalMinutes -ge $LockoutMinutes) {
+            $record.FailureCount = 0
+            $record.FirstFailureUtc = $now
+        }
+
         $record.FailureCount++
         if ($record.FailureCount -ge $MaxAuthFailures) {
             $record.LockedUntilUtc = $now.AddMinutes($LockoutMinutes)
         }
         $Tracker[$ClientIp] = $record
+
+        # Bound tracker memory if distinct tracking entries accumulate
+        if ($Tracker.Count -ge 100) {
+            Remove-ExpiredAuthFailures -Tracker $Tracker -MaxAgeMinutes ([Math]::Max(60, $LockoutMinutes * 2))
+        }
     }
     finally {
         [System.Threading.Monitor]::Exit($Tracker.SyncRoot)
@@ -113,4 +136,46 @@ function Clear-AuthFailures {
     }
 }
 
-Export-ModuleMember -Function New-FailureTracker, Get-LockoutRetryAfterSeconds, Add-AuthFailure, Clear-AuthFailures
+function Remove-ExpiredAuthFailures {
+    <#
+        Removes expired or stale failure records from the tracker to prevent unbounded memory growth.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [hashtable]$Tracker,
+
+        [int]$MaxAgeMinutes = 60
+    )
+
+    [System.Threading.Monitor]::Enter($Tracker.SyncRoot)
+    try {
+        $now = [DateTime]::UtcNow
+        $keysToRemove = [System.Collections.ArrayList]::new()
+        foreach ($ip in $Tracker.Keys) {
+            $record = $Tracker[$ip]
+            $isStale = $false
+            if ($null -ne $record.LockedUntilUtc) {
+                if (($now - $record.LockedUntilUtc).TotalMinutes -ge $MaxAgeMinutes) {
+                    $isStale = $true
+                }
+            }
+            elseif (($now - $record.FirstFailureUtc).TotalMinutes -ge $MaxAgeMinutes) {
+                $isStale = $true
+            }
+
+            if ($isStale) {
+                [void]$keysToRemove.Add($ip)
+            }
+        }
+
+        foreach ($ip in $keysToRemove) {
+            [void]$Tracker.Remove($ip)
+        }
+    }
+    finally {
+        [System.Threading.Monitor]::Exit($Tracker.SyncRoot)
+    }
+}
+
+Export-ModuleMember -Function New-FailureTracker, Get-LockoutRetryAfterSeconds, Add-AuthFailure, Clear-AuthFailures, Remove-ExpiredAuthFailures

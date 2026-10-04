@@ -58,18 +58,49 @@ function Read-XmlFileBytes {
 
     $stream = Get-XmlStreamWithRetry -Path $Path -MaxRetries $MaxRetries -DelayMs $DelayMs
     try {
-        $buffer = [byte[]]::new($stream.Length)
-        $totalRead = 0
-        while ($totalRead -lt $buffer.Length) {
-            $read = $stream.Read($buffer, $totalRead, $buffer.Length - $totalRead)
-            if ($read -le 0) { break }
-            $totalRead += $read
+        $ms = [System.IO.MemoryStream]::new()
+        try {
+            $stream.CopyTo($ms)
+            return $ms.ToArray()
         }
-        return $buffer
+        finally {
+            $ms.Dispose()
+        }
     }
     finally {
         $stream.Dispose()
     }
 }
 
-Export-ModuleMember -Function Get-XmlStreamWithRetry, Read-XmlFileBytes
+function Send-Status {
+    <#
+        Writes HTTP status code, headers, and optional body to HttpListenerResponse.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [System.Net.HttpListenerResponse]$Response,
+
+        [Parameter(Mandatory)]
+        [int]$Code,
+
+        [hashtable]$Headers = @{},
+
+        [byte[]]$Body = $null,
+
+        [string]$ContentType = $null
+    )
+
+    $Response.StatusCode = $Code
+    foreach ($h in $Headers.Keys) { $Response.AddHeader($h, [string]$Headers[$h]) }
+    if ($ContentType) { $Response.ContentType = $ContentType }
+    if ($null -ne $Body) {
+        $Response.ContentLength64 = $Body.Length
+        $Response.OutputStream.Write($Body, 0, $Body.Length)
+    }
+    else {
+        $Response.ContentLength64 = 0
+    }
+}
+
+Export-ModuleMember -Function Get-XmlStreamWithRetry, Read-XmlFileBytes, Send-Status

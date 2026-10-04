@@ -11,36 +11,44 @@
     .\New-PasswordHash.ps1 -PlainPassword 'S3cret!' -Iterations 100000
 #>
 [CmdletBinding()]
+[OutputType([pscustomobject])]
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'PlainPassword', Justification = 'Mandated by spec 7.2 CLI signature')]
 param (
-    [Parameter(Mandatory)]
+    [Parameter(Mandatory, Position = 0, ValueFromPipeline)]
     [string]$PlainPassword,
 
     [int]$Iterations = 100000
 )
 
-Set-StrictMode -Version Latest
-
-$saltBytes = [byte[]]::new(32)
-$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-try {
-    $rng.GetBytes($saltBytes)
-}
-finally {
-    $rng.Dispose()
+begin {
+    Set-StrictMode -Version Latest
 }
 
-$pbkdf2 = [System.Security.Cryptography.Rfc2898DeriveBytes]::new(
-    $PlainPassword,
-    $saltBytes,
-    $Iterations,
-    [System.Security.Cryptography.HashAlgorithmName]::SHA256)   # explicit SHA256 - do NOT use the legacy overload
-try {
-    $hashBytes = $pbkdf2.GetBytes(32)
-}
-finally {
-    $pbkdf2.Dispose()
-}
+process {
+    $saltBytes = [byte[]]::new(32)
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $rng.GetBytes($saltBytes)
+    }
+    finally {
+        $rng.Dispose()
+    }
 
-Write-Host 'PasswordSaltBase64:' ([Convert]::ToBase64String($saltBytes))
-Write-Host 'PasswordHashBase64:' ([Convert]::ToBase64String($hashBytes))
-Write-Host 'Pbkdf2Iterations:  ' $Iterations
+    $pbkdf2 = [System.Security.Cryptography.Rfc2898DeriveBytes]::new(
+        $PlainPassword,
+        $saltBytes,
+        $Iterations,
+        [System.Security.Cryptography.HashAlgorithmName]::SHA256)   # explicit SHA256 - do NOT use the legacy overload
+    try {
+        $hashBytes = $pbkdf2.GetBytes(32)
+    }
+    finally {
+        $pbkdf2.Dispose()
+    }
+
+    [pscustomobject]@{
+        PasswordSaltBase64 = [Convert]::ToBase64String($saltBytes)
+        PasswordHashBase64 = [Convert]::ToBase64String($hashBytes)
+        Pbkdf2Iterations   = $Iterations
+    }
+}

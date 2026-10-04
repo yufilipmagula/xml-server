@@ -10,6 +10,8 @@ Set-StrictMode -Version Latest
     audit_YYYY-MM-DD.log. Retention purge removes files older than RetainDays.
 #>
 
+$script:Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+
 function New-LogLock {
     [CmdletBinding()]
     [OutputType([object])]
@@ -70,7 +72,7 @@ function Write-AuditLog {
 
     [System.Threading.Monitor]::Enter($LogLock)
     try {
-        Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8
+        [System.IO.File]::AppendAllText($logFile, $line + [Environment]::NewLine, $script:Utf8NoBom)
     }
     finally {
         [System.Threading.Monitor]::Exit($LogLock)
